@@ -1,0 +1,25 @@
+# Core dependencies for CoachCube Vision Pipeline v2.0
+
+# Basic requirements
+numpy>=1.21.0
+tomli>=2.0.0  # TOML parser for Python < 3.11
+
+# Computer Vision and ML (to be added when implementing other modules)
+# opencv-python>=4.8.0
+# ultralytics>=8.0.0  # YOLO v11
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# Streaming and Communication (to be added)
+# websockets>=11.0
+
+# Visualization (for tools)
+# matplotlib>=3.5.0
+
+# Video Processing (for recording)
+# imageio-ffmpeg>=0.4.0
+
+# Development tools (optional)
+# black>=23.0.0  # Code formatter
+# pytest>=7.0.0  # Testing framework
+# mypy>=1.0.0    # Type checking
