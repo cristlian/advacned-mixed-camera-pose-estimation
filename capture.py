@@ -20,7 +20,6 @@ Date: 2025
 import abc
 import logging
 import os
-import queue
 import threading
 import time
 from collections import deque
@@ -166,6 +165,391 @@ class USBCamera(CameraInterface):
             
             if not self.cap.isOpened():
                 return False
+    
+    def _capture_loop(self, camera_id: str) -> None:
+        """Main capture loop for a single camera."""
+        camera = self.cameras[camera_id]
+        buffer = self.frame_buffers[camera_id]
+        config = self.camera_configs[camera_id]
+        
+        frame_number = 0
+        last_stats_update = time.perf_counter()
+        fps_frame_count = 0
+        
+        while not self.stop_event.is_set():
+            try:
+                if self.sync_strategy == SyncStrategy.SOFTWARE_TRIGGER:
+                    self.sync_event.wait(timeout=0.1)
+                    if not self.sync_event.is_set():
+                        continue
+                
+                capture_start = time.perf_counter()
+                frame = camera.capture_frame()
+                capture_time = time.perf_counter()
+                
+                if frame is not None:
+                    packet = FramePacket(
+                        frame=frame,
+                        camera_id=camera_id,
+                        frame_number=frame_number,
+                        timestamp=capture_time,
+                        hardware_timestamp=camera.get_hardware_timestamp(),
+                        latency_ms=(capture_time - capture_start) * 1000
+                    )
+                    
+                    buffer.append(packet)
+                    frame_number += 1
+                    fps_frame_count += 1
+                    
+                    camera.stats.frames_captured = frame_number
+                    camera.stats.latency_ms = packet.latency_ms
+                    camera.stats.buffer_usage = (len(buffer) / config.buffer_size) * 100
+                    
+                    current_time = time.perf_counter()
+                    if current_time - last_stats_update >= 1.0:
+                        camera.stats.current_fps = fps_frame_count / (current_time - last_stats_update)
+                        camera.stats.average_fps = frame_number / (current_time - self.start_time)
+                        last_stats_update = current_time
+                        fps_frame_count = 0
+                else:
+                    camera.stats.frames_dropped += 1
+                    
+                    if not camera.is_connected:
+                        logger.warning(f"Camera {camera_id} disconnected, attempting reconnection...")
+                        if self._connect_with_retry(camera):
+                            logger.info(f"Camera {camera_id} reconnected successfully")
+                        else:
+                            logger.error(f"Failed to reconnect camera {camera_id}")
+                            break
+                
+                if self.sync_strategy == SyncStrategy.SOFTWARE_TRIGGER:
+                    self.sync_event.clear()
+                    
+            except Exception as e:
+                logger.error(f"Error in capture loop for {camera_id}: {e}")
+                camera.stats.errors.append(str(e))
+                if self.error_callback:
+                    self.error_callback(camera_id, e)
+                time.sleep(0.1)
+        
+        logger.info(f"Capture loop ended for {camera_id}")
+    
+    def _monitor_loop(self) -> None:
+        """Monitor performance and system health."""
+        while not self.stop_event.is_set():
+            try:
+                if self.frame_callback:
+                    frames = self.get_synchronized_frames()
+                    if frames:
+                        self.frame_callback(frames)
+                
+                if time.perf_counter() % 10 < 0.1:
+                    self._log_performance_stats()
+                
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Error in monitor loop: {e}")
+    
+    def _log_performance_stats(self) -> None:
+        """Log performance statistics."""
+        total_captured = sum(s.frames_captured for s in self.stats.values())
+        total_dropped = sum(s.frames_dropped for s in self.stats.values())
+        avg_fps = sum(s.current_fps for s in self.stats.values()) / len(self.stats) if self.stats else 0
+        
+        logger.info(f"Capture Stats - Frames: {total_captured}, Dropped: {total_dropped}, Avg FPS: {avg_fps:.1f}")
+        
+        for camera_id, stats in self.stats.items():
+            if stats.frames_dropped > 0:
+                drop_rate = (stats.frames_dropped / max(stats.frames_captured, 1)) * 100
+                if drop_rate > 1.0:
+                    logger.warning(f"Camera {camera_id} drop rate: {drop_rate:.1f}%")
+    
+    def trigger_synchronized_capture(self) -> None:
+        """Trigger synchronized capture across all cameras."""
+        if self.sync_strategy == SyncStrategy.SOFTWARE_TRIGGER:
+            self.sync_event.set()
+        elif self.sync_strategy == SyncStrategy.HARDWARE_TRIGGER:
+            for camera in self.cameras.values():
+                camera.trigger_capture()
+    
+    def get_synchronized_frames(self, timeout: float = 0.1) -> Optional[Dict[str, FramePacket]]:
+        """Get synchronized frames from all cameras."""
+        frames = {}
+        for camera_id, buffer in self.frame_buffers.items():
+            if buffer:
+                frames[camera_id] = buffer[-1]
+        
+        if len(frames) != len(self.cameras):
+            return None
+        
+        if self.sync_strategy == SyncStrategy.TIMESTAMP_ALIGN:
+            timestamps = [f.timestamp for f in frames.values()]
+            time_spread = max(timestamps) - min(timestamps)
+            
+            if time_spread * 1000 > self.sync_tolerance_ms:
+                return self._find_aligned_frames()
+        
+        return frames
+    
+    def _find_aligned_frames(self) -> Optional[Dict[str, FramePacket]]:
+        """Find best aligned frames across cameras."""
+        if not all(self.frame_buffers.values()):
+            return None
+        
+        best_frames = {}
+        best_spread = float('inf')
+        
+        check_depth = min(5, min(len(b) for b in self.frame_buffers.values()))
+        
+        for i in range(check_depth):
+            candidate_frames = {}
+            for camera_id, buffer in self.frame_buffers.items():
+                if len(buffer) > i:
+                    candidate_frames[camera_id] = buffer[-(i+1)]
+            
+            if len(candidate_frames) == len(self.cameras):
+                timestamps = [f.timestamp for f in candidate_frames.values()]
+                spread = max(timestamps) - min(timestamps)
+                
+                if spread < best_spread:
+                    best_spread = spread
+                    best_frames = candidate_frames
+        
+        if best_spread * 1000 <= self.sync_tolerance_ms:
+            return best_frames
+        
+        return None
+    
+    def get_latest_frame(self, camera_id: str) -> Optional[FramePacket]:
+        """Get the latest frame from a specific camera."""
+        buffer = self.frame_buffers.get(camera_id)
+        return buffer[-1] if buffer else None
+    
+    def get_stats(self) -> Dict[str, CaptureStats]:
+        """Get current capture statistics."""
+        return self.stats.copy()
+    
+    def set_frame_callback(self, callback: Callable[[Dict[str, FramePacket]], None]) -> None:
+        """Set callback for synchronized frames."""
+        self.frame_callback = callback
+    
+    def set_error_callback(self, callback: Callable[[str, Exception], None]) -> None:
+        """Set callback for error handling."""
+        self.error_callback = callback
+    
+    def save_calibration_frames(self, output_dir: Path, num_frames: int = 10, delay_ms: int = 500) -> bool:
+        """Save frames for calibration purposes."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        saved_count = 0
+        for i in range(num_frames):
+            frames = self.get_synchronized_frames(timeout=1.0)
+            if frames:
+                for camera_id, packet in frames.items():
+                    filename = output_dir / f"{camera_id}_frame_{i:04d}.jpg"
+                    cv2.imwrite(str(filename), packet.frame)
+                saved_count += 1
+                logger.info(f"Saved calibration frame {i+1}/{num_frames}")
+            
+            time.sleep(delay_ms / 1000.0)
+        
+        return saved_count == num_frames
+
+
+def create_test_cameras(num_cameras: int = 3) -> List[CameraConfig]:
+    """Create test camera configurations."""
+    configs = []
+    for i in range(num_cameras):
+        config = CameraConfig(
+            camera_id=f"camera_{i}",
+            source=i,
+            camera_type=CameraType.USB,
+            resolution=(1920, 1080),
+            fps=30,
+            buffer_size=30,
+            reconnect_attempts=3,
+            codec="MJPG"
+        )
+        configs.append(config)
+    return configs
+
+
+if __name__ == "__main__":
+    """Test the capture module."""
+    import argparse
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    parser = argparse.ArgumentParser(description="Test multi-camera capture")
+    parser.add_argument('--cameras', type=int, nargs='+', default=[0],
+                       help='Camera indices to use')
+    parser.add_argument('--resolution', type=int, nargs=2, default=[1920, 1080],
+                       help='Camera resolution (width height)')
+    parser.add_argument('--fps', type=float, default=30,
+                       help='Target FPS')
+    parser.add_argument('--duration', type=int, default=10,
+                       help='Test duration in seconds')
+    parser.add_argument('--sync', type=str, default='timestamp',
+                       choices=['hardware', 'software', 'timestamp', 'best_effort'],
+                       help='Synchronization strategy')
+    parser.add_argument('--display', action='store_true',
+                       help='Display captured frames')
+    
+    args = parser.parse_args()
+    
+    # Create camera configurations
+    configs = []
+    for i, cam_idx in enumerate(args.cameras):
+        config = CameraConfig(
+            camera_id=f"camera_{i}",
+            source=cam_idx,
+            camera_type=CameraType.USB,
+            resolution=tuple(args.resolution),
+            fps=args.fps,
+            buffer_size=30,
+            codec="MJPG"
+        )
+        configs.append(config)
+    
+    # Create capture system
+    capture = MultiCameraCapture(
+        camera_configs=configs,
+        sync_strategy=SyncStrategy[args.sync.upper()],
+        sync_tolerance_ms=10.0,
+        enable_monitoring=True
+    )
+    
+    # Start capture
+    if capture.start():
+        print(f"Capturing for {args.duration} seconds...")
+        
+        # Display frames if requested
+        if args.display:
+            start_time = time.perf_counter()
+            while time.perf_counter() - start_time < args.duration:
+                frames = capture.get_synchronized_frames()
+                if frames:
+                    for camera_id, packet in frames.items():
+                        cv2.imshow(camera_id, packet.frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+            cv2.destroyAllWindows()
+        else:
+            time.sleep(args.duration)
+        
+        # Print final stats
+        stats = capture.get_stats()
+        print("\nFinal Statistics:")
+        for camera_id, stat in stats.items():
+            print(f"  {camera_id}: {stat.frames_captured} frames, {stat.average_fps:.1f} FPS")
+        
+        capture.stop()
+    else:
+        print("Failed to start capture system")
+    
+    def _capture_loop(self, camera_id: str) -> None:
+        """Main capture loop for a single camera."""
+        camera = self.cameras[camera_id]
+        buffer = self.frame_buffers[camera_id]
+        config = self.camera_configs[camera_id]
+        
+        frame_number = 0
+        last_stats_update = time.perf_counter()
+        fps_frame_count = 0
+        
+        while not self.stop_event.is_set():
+            try:
+                if self.sync_strategy == SyncStrategy.SOFTWARE_TRIGGER:
+                    self.sync_event.wait(timeout=0.1)
+                    if not self.sync_event.is_set():
+                        continue
+                
+                capture_start = time.perf_counter()
+                frame = camera.capture_frame()
+                capture_time = time.perf_counter()
+                
+                if frame is not None:
+                    packet = FramePacket(
+                        frame=frame,
+                        camera_id=camera_id,
+                        frame_number=frame_number,
+                        timestamp=capture_time,
+                        hardware_timestamp=camera.get_hardware_timestamp(),
+                        latency_ms=(capture_time - capture_start) * 1000
+                    )
+                    
+                    buffer.append(packet)
+                    frame_number += 1
+                    fps_frame_count += 1
+                    
+                    camera.stats.frames_captured = frame_number
+                    camera.stats.latency_ms = packet.latency_ms
+                    camera.stats.buffer_usage = (len(buffer) / config.buffer_size) * 100
+                    
+                    current_time = time.perf_counter()
+                    if current_time - last_stats_update >= 1.0:
+                        camera.stats.current_fps = fps_frame_count / (current_time - last_stats_update)
+                        camera.stats.average_fps = frame_number / (current_time - self.start_time)
+                        last_stats_update = current_time
+                        fps_frame_count = 0
+                else:
+                    camera.stats.frames_dropped += 1
+                    
+                    if not camera.is_connected:
+                        logger.warning(f"Camera {camera_id} disconnected, attempting reconnection...")
+                        if self._connect_with_retry(camera):
+                            logger.info(f"Camera {camera_id} reconnected successfully")
+                        else:
+                            logger.error(f"Failed to reconnect camera {camera_id}")
+                            break
+                
+                if self.sync_strategy == SyncStrategy.SOFTWARE_TRIGGER:
+                    self.sync_event.clear()
+                    
+            except Exception as e:
+                logger.error(f"Error in capture loop for {camera_id}: {e}")
+                camera.stats.errors.append(str(e))
+                if self.error_callback:
+                    self.error_callback(camera_id, e)
+                time.sleep(0.1)
+        
+        logger.info(f"Capture loop ended for {camera_id}")
+    
+    def _monitor_loop(self) -> None:
+        """Monitor performance and system health."""
+        while not self.stop_event.is_set():
+            try:
+                if self.frame_callback:
+                    frames = self.get_synchronized_frames()
+                    if frames:
+                        self.frame_callback(frames)
+                
+                if time.perf_counter() % 10 < 0.1:
+                    self._log_performance_stats()
+                
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Error in monitor loop: {e}")
+    
+    def _log_performance_stats(self) -> None:
+        """Log performance statistics."""
+        total_captured = sum(s.frames_captured for s in self.stats.values())
+        total_dropped = sum(s.frames_dropped for s in self.stats.values())
+        avg_fps = sum(s.current_fps for s in self.stats.values()) / len(self.stats) if self.stats else 0
+        
+        logger.info(f"Capture Stats - Frames: {total_captured}, Dropped: {total_dropped}, Avg FPS: {avg_fps:.1f}")
+        
+        for camera_id, stats in self.stats.items():
+            if stats.frames_dropped > 0:
+                drop_rate = (stats.frames_dropped / max(stats.frames_captured, 1)) * 100
+                if drop_rate > 1.0:
+                    logger.warning(f"Camera {camera_id} drop rate: {drop_rate:.1f}%")
             
             # Configure camera for optimal performance
             self._configure_camera()
@@ -433,40 +817,25 @@ class MultiCameraCapture:
         elif config.camera_type == CameraType.IP:
             return IPCamera(config)
         elif config.camera_type == CameraType.FILE:
-            # Use USB camera for file playback
             return USBCamera(config)
         else:
             raise ValueError(f"Unsupported camera type: {config.camera_type}")
     
     def start(self) -> bool:
-        """
-        Start all cameras and capture threads.
-        
-        Returns:
-            True if all cameras started successfully
-        """
+        """Start all cameras and capture threads."""
         logger.info("Starting multi-camera capture system...")
         self.start_time = time.perf_counter()
         self.stop_event.clear()
         
-        # Initialize cameras
         success_count = 0
         for camera_id, config in self.camera_configs.items():
             try:
-                # Create camera instance
                 camera = self._create_camera(config)
-                
-                # Connect with retries
-                connected = self._connect_with_retry(camera)
-                
-                if connected:
+                if self._connect_with_retry(camera):
                     self.cameras[camera_id] = camera
                     self.stats[camera_id] = camera.stats
-                    
-                    # Initialize ring buffer
                     self.frame_buffers[camera_id] = deque(maxlen=config.buffer_size)
                     
-                    # Start capture thread
                     thread = threading.Thread(
                         target=self._capture_loop,
                         args=(camera_id,),
@@ -480,13 +849,11 @@ class MultiCameraCapture:
                     logger.info(f"Started capture thread for {camera_id}")
                 else:
                     logger.error(f"Failed to connect camera {camera_id}")
-                    
             except Exception as e:
                 logger.error(f"Failed to initialize camera {camera_id}: {e}")
                 if self.error_callback:
                     self.error_callback(camera_id, e)
         
-        # Start monitoring thread
         if self.enable_monitoring and success_count > 0:
             self.monitor_thread = threading.Thread(
                 target=self._monitor_loop,
@@ -494,7 +861,6 @@ class MultiCameraCapture:
             )
             self.monitor_thread.daemon = True
             self.monitor_thread.start()
-            logger.info("Started performance monitoring thread")
         
         logger.info(f"Multi-camera capture started: {success_count}/{len(self.camera_configs)} cameras active")
         return success_count > 0
@@ -502,22 +868,17 @@ class MultiCameraCapture:
     def stop(self) -> None:
         """Stop all cameras and threads."""
         logger.info("Stopping multi-camera capture system...")
-        
-        # Signal stop
         self.stop_event.set()
         
-        # Wait for threads to finish
         for thread in self.capture_threads.values():
             thread.join(timeout=2.0)
         
         if self.monitor_thread:
             self.monitor_thread.join(timeout=1.0)
         
-        # Disconnect cameras
         for camera in self.cameras.values():
             camera.disconnect()
         
-        # Clear buffers
         self.frame_buffers.clear()
         self.capture_threads.clear()
         self.cameras.clear()
@@ -526,14 +887,109 @@ class MultiCameraCapture:
     
     def _connect_with_retry(self, camera: CameraInterface) -> bool:
         """Connect to camera with retry logic."""
-        config = camera.config
-        
-        for attempt in range(config.reconnect_attempts):
+        for attempt in range(camera.config.reconnect_attempts):
             if camera.connect():
                 return True
-            
-            if attempt < config.reconnect_attempts - 1:
-                logger.warning(f"Connection attempt {attempt + 1} failed for {config.camera_id}, retrying...")
-                time.sleep(config.reconnect_delay)
-        
+            if attempt < camera.config.reconnect_attempts - 1:
+                logger.warning(f"Connection attempt {attempt + 1} failed for {camera.config.camera_id}, retrying...")
+                time.sleep(camera.config.reconnect_delay)
         return False
+    
+    def _capture_loop(self, camera_id: str) -> None:
+        """Main capture loop for a single camera."""
+        camera = self.cameras[camera_id]
+        buffer = self.frame_buffers[camera_id]
+        config = self.camera_configs[camera_id]
+        
+        frame_number = 0
+        last_stats_update = time.perf_counter()
+        fps_frame_count = 0
+        
+        while not self.stop_event.is_set():
+            try:
+                if self.sync_strategy == SyncStrategy.SOFTWARE_TRIGGER:
+                    self.sync_event.wait(timeout=0.1)
+                    if not self.sync_event.is_set():
+                        continue
+                
+                capture_start = time.perf_counter()
+                frame = camera.capture_frame()
+                capture_time = time.perf_counter()
+                
+                if frame is not None:
+                    packet = FramePacket(
+                        frame=frame,
+                        camera_id=camera_id,
+                        frame_number=frame_number,
+                        timestamp=capture_time,
+                        hardware_timestamp=camera.get_hardware_timestamp(),
+                        latency_ms=(capture_time - capture_start) * 1000
+                    )
+                    
+                    buffer.append(packet)
+                    frame_number += 1
+                    fps_frame_count += 1
+                    
+                    camera.stats.frames_captured = frame_number
+                    camera.stats.latency_ms = packet.latency_ms
+                    camera.stats.buffer_usage = (len(buffer) / config.buffer_size) * 100
+                    
+                    current_time = time.perf_counter()
+                    if current_time - last_stats_update >= 1.0:
+                        camera.stats.current_fps = fps_frame_count / (current_time - last_stats_update)
+                        camera.stats.average_fps = frame_number / (current_time - self.start_time)
+                        last_stats_update = current_time
+                        fps_frame_count = 0
+                else:
+                    camera.stats.frames_dropped += 1
+                    
+                    if not camera.is_connected:
+                        logger.warning(f"Camera {camera_id} disconnected, attempting reconnection...")
+                        if self._connect_with_retry(camera):
+                            logger.info(f"Camera {camera_id} reconnected successfully")
+                        else:
+                            logger.error(f"Failed to reconnect camera {camera_id}")
+                            break
+                
+                if self.sync_strategy == SyncStrategy.SOFTWARE_TRIGGER:
+                    self.sync_event.clear()
+                    
+            except Exception as e:
+                logger.error(f"Error in capture loop for {camera_id}: {e}")
+                camera.stats.errors.append(str(e))
+                if self.error_callback:
+                    self.error_callback(camera_id, e)
+                time.sleep(0.1)
+        
+        logger.info(f"Capture loop ended for {camera_id}")
+    
+    def _monitor_loop(self) -> None:
+        """Monitor performance and system health."""
+        while not self.stop_event.is_set():
+            try:
+                if self.frame_callback:
+                    frames = self.get_synchronized_frames()
+                    if frames:
+                        self.frame_callback(frames)
+                
+                if time.perf_counter() % 10 < 0.1:
+                    self._log_performance_stats()
+                
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Error in monitor loop: {e}")
+    
+    def _log_performance_stats(self) -> None:
+        """Log performance statistics."""
+        total_captured = sum(s.frames_captured for s in self.stats.values())
+        total_dropped = sum(s.frames_dropped for s in self.stats.values())
+        avg_fps = sum(s.current_fps for s in self.stats.values()) / len(self.stats) if self.stats else 0
+        
+        logger.info(f"Capture Stats - Frames: {total_captured}, Dropped: {total_dropped}, Avg FPS: {avg_fps:.1f}")
+        
+        for camera_id, stats in self.stats.items():
+            if stats.frames_dropped > 0:
+                drop_rate = (stats.frames_dropped / max(stats.frames_captured, 1)) * 100
+                if drop_rate > 1.0:
+                    logger.warning(f"Camera {camera_id} drop rate: {drop_rate:.1f}%")
