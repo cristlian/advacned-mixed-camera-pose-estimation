@@ -1,12 +1,12 @@
 """
-Calibration Loader Module for CoachCube Vision Pipeline
+Calibration Loader Module for Multi-Camera 3D Vision Pipeline
 
 This module handles loading camera calibration data from configuration files,
 including intrinsics (from TOML) and extrinsics (from JSON). It identifies
 camera types (standard vs fisheye) and packages all calibration data into
 structured dataclass objects for use throughout the pipeline.
 
-Author: CoachCube Vision Team
+Author: Personal Vision Project
 Date: 2025
 """
 

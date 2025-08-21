@@ -1,11 +1,11 @@
 """
-CoachCube Vision Pipeline - Main Entry Point
+Multi-Camera 3D Vision Pipeline - Main Entry Point
 
 This is the lean entry point that orchestrates the modular pipeline components.
 Currently demonstrates the calibration loading functionality as the foundation
 for the complete vision pipeline.
 
-Author: CoachCube Vision Team
+Author: Personal Vision Project
 Date: 2025
 """
 
@@ -38,7 +38,7 @@ def print_calibration_summary(calibrations: List[CameraCalibration]) -> None:
         calibrations: List of CameraCalibration objects to summarize
     """
     print("\n" + "="*80)
-    print("COACHCUBE VISION - CALIBRATION SUMMARY")
+    print("MULTI-CAMERA 3D VISION - CALIBRATION SUMMARY")
     print("="*80)
     
     for cal in calibrations:
@@ -126,7 +126,7 @@ def parse_arguments() -> argparse.Namespace:
         Parsed arguments namespace
     """
     parser = argparse.ArgumentParser(
-        description="CoachCube Vision Pipeline - Modular 3D Motion Capture System",
+        description="Multi-Camera 3D Vision Pipeline - Modular Motion Capture System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -209,7 +209,7 @@ def main() -> int:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    logger.info("Starting CoachCube Vision Pipeline (Modular Architecture v2.0)")
+    logger.info("Starting Multi-Camera 3D Vision Pipeline (Modular Architecture v2.0)")
     
     try:
         # Handle sample generation

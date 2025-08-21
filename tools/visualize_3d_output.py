@@ -1,11 +1,11 @@
 """
-3D Output Visualization Tool for CoachCube Vision
+3D Output Visualization Tool for Multi-Camera Vision Pipeline
 
 This standalone tool provides offline analysis and visualization of the
 pipeline's JSON output. It creates interactive, animated 3D plots showing
 the captured motion, camera positions, and confidence levels.
 
-Author: CoachCube Vision Team
+Author: Personal Vision Project
 Date: 2025
 Status: Placeholder - To be implemented after core pipeline modules
 """

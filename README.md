@@ -1,8 +1,8 @@
-# CoachCube Vision - Modular Pipeline v2.0
+# Multi-Camera 3D Vision Pipeline - Modular Architecture v2.0
 
 ## 🏗️ Architecture Overview
 
-This is the new modular implementation of the CoachCube Vision system, featuring a clean separation of concerns and support for fisheye cameras.
+This is a modular real-time 3D human pose estimation system using multiple synchronized cameras with fisheye support. Built for sports performance analysis and motion capture applications.
 
 ### Module Structure
 
@@ -14,7 +14,7 @@ vision-new/
 ├── detection.py           # YOLO pose detection with fisheye support (TODO)
 ├── triangulation.py       # Multi-view 3D reconstruction (TODO)
 ├── filtering.py           # Kalman filtering for temporal smoothing (TODO)
-├── streaming.py           # WebSocket server for Unity (TODO)
+├── streaming.py           # WebSocket server for real-time clients (TODO)
 └── tools/
     └── visualize_3d_output.py  # Offline 3D visualization tool (TODO)
 ```
@@ -25,8 +25,8 @@ vision-new/
 
 ```bash
 # Create conda environment
-conda create -n coachcube_vision python=3.9
-conda activate coachcube_vision
+conda create -n vision3d python=3.9
+conda activate vision3d
 
 # Install dependencies
 pip install numpy tomli
@@ -52,7 +52,7 @@ python main.py --intrinsics cal.toml --extrinsics ext.json --cameras 0 2
 ```toml
 [camera_0]
 image_size = [1920, 1080]
-fisheye = false  # NEW: Camera type flag
+fisheye = false  # Camera type flag
 camera_matrix = [
     [fx, 0.0, cx],
     [0.0, fy, cy],
@@ -78,7 +78,7 @@ distortion_coeffs = [k1, k2, p1, p2, k3]  # 5 params for standard, 4 for fisheye
 
 ## 🐟 Fisheye Camera Support
 
-The pipeline now supports fisheye cameras through the `is_fisheye` flag in the calibration:
+The pipeline supports fisheye cameras through the `is_fisheye` flag in the calibration:
 
 - **Phase 0 (Current)**: Detect on distorted image, correct keypoints only
 - **Phase 1 (Planned)**: Dynamic ROI undistortion
@@ -151,12 +151,27 @@ python main.py --generate-samples
 python main.py --generate-samples --test-projection --verbose
 ```
 
-## 📝 Notes
+## 📝 System Requirements
 
-- The system expects 3 cameras by default (indices 0, 1, 2)
-- Fisheye cameras should have `fisheye = true` in the TOML config
-- All coordinates are in meters for world space, pixels for image space
-- The pipeline is designed for real-time performance (target: 30 FPS)
+- **GPU**: NVIDIA GPU with 6GB+ VRAM (RTX 3060 or better recommended)
+- **Cameras**: 3× USB3.0 webcams or IP cameras
+- **CPU**: 8+ cores recommended for threaded pipeline
+- **RAM**: 16GB minimum
+- **Python**: 3.9+
+
+## 🎯 Target Performance
+
+- Real-time processing at 30 FPS
+- Sub-50ms end-to-end latency
+- 3D reconstruction accuracy < 1cm
+- Support for up to 6 cameras
+
+## 📐 Coordinate System
+
+- World coordinates in meters
+- Image coordinates in pixels
+- Right-handed coordinate system
+- Y-axis points up, Z-axis points forward
 
 ## 🤝 Contributing
 
@@ -167,8 +182,12 @@ Please follow the established patterns:
 - Log important operations
 - Maintain the modular structure
 
+## 📄 License
+
+This is a personal project for research and educational purposes.
+
 ---
 
-**Author**: CoachCube Vision Team  
+**Author**: Personal Vision Project  
 **Version**: 2.0 (Modular Architecture)  
 **Status**: Foundation Complete, Core Modules In Development
